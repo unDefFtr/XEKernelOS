@@ -87,6 +87,10 @@ LFSTEST_SRC = $(SRCDIR)/user/lfstest.cpp
 LFSTEST_ELF = $(BLDDIR)/lfstest.elf
 LFSTEST_BIN = $(BLDDIR)/lfstest.bin
 
+# Hardware segment-boundary regression and exec probe share one flat source.
+SEGTEST_BIN = $(BLDDIR)/segtest.bin
+SEGEXEC_BIN = $(BLDDIR)/segexec.bin
+
 CXXFLAGS = -target $(TARGET) -ffreestanding -nostdlib -Wall -Wextra -O1 \
            -fno-exceptions -fno-rtti -fno-use-cxa-atexit -std=c++17 \
            -mno-sse -mno-mmx -mno-sse2 -I $(SRCDIR)
@@ -107,7 +111,7 @@ USHELL_ELF   = $(BLDDIR)/ushell.elf
 USHELL_BIN   = $(BLDDIR)/ushell.bin
 USHELL_HDR   = $(SRCDIR)/user/ushell_blob.h
 
-all: $(IMG) $(HELLO_BIN) $(TEST_ELF) $(USHELL_HDR) $(FONT_BIN) $(DISK_IMG) $(DEMO_BIN) $(DESKTOP_BIN) $(SPIN_BIN) $(LFSTEST_BIN) $(GFXDEMO_BIN) $(BOUNCE_BIN) $(TESTGFX_BIN)
+all: $(IMG) $(HELLO_BIN) $(TEST_ELF) $(USHELL_HDR) $(FONT_BIN) $(DISK_IMG) $(DEMO_BIN) $(DESKTOP_BIN) $(SPIN_BIN) $(LFSTEST_BIN) $(GFXDEMO_BIN) $(BOUNCE_BIN) $(TESTGFX_BIN) $(SEGTEST_BIN) $(SEGEXEC_BIN)
 
 # ... existing targets ...
 
@@ -127,7 +131,7 @@ $(ISR_OBJ): $(ISR_ASM) | $(BLDDIR)
 
 $(BLDDIR)/%.o: $(SRCDIR)/%.cpp | $(BLDDIR)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 # shell.o also depends on the embedded user-shell blob
 $(BLDDIR)/shell/shell.o: $(USHELL_HDR)
@@ -166,6 +170,12 @@ $(TESTGFX_BIN): $(SRCDIR)/user/testgfx.asm | $(BLDDIR)
 	$(NASM) -f bin $< -o $@
 	@echo "  TestGFX: $$(wc -c < $@)B"
 
+
+$(SEGTEST_BIN): $(SRCDIR)/user/segtest.asm | $(BLDDIR)
+	$(NASM) -f bin $< -o $@
+
+$(SEGEXEC_BIN): $(SRCDIR)/user/segtest.asm | $(BLDDIR)
+	$(NASM) -DEXEC_PROBE=1 -f bin $< -o $@
 $(TEST_ELF_O): $(TEST_ELF_ASM) | $(BLDDIR)
 	$(NASM) -f elf32 $< -o $@
 
@@ -222,7 +232,7 @@ $(LFSTEST_BIN): $(LFSTEST_ELF)
 
 # Build FAT12 disk image with CJK font + ext2 injected
 DISK_SIZE = 4194304  # 4MB
-$(DISK_IMG): $(HELLO_BIN) $(TEST_ELF) $(FONT_BIN) $(DEMO_BIN) $(DESKTOP_BIN) $(SPIN_BIN) $(LFSTEST_BIN) $(USHELL_BIN) $(GFXDEMO_BIN) $(BOUNCE_BIN) $(TESTGFX_BIN) $(EXT2_IMG) tools/mkdisk.py
+$(DISK_IMG): $(HELLO_BIN) $(TEST_ELF) $(FONT_BIN) $(DEMO_BIN) $(DESKTOP_BIN) $(SPIN_BIN) $(LFSTEST_BIN) $(USHELL_BIN) $(GFXDEMO_BIN) $(BOUNCE_BIN) $(TESTGFX_BIN) $(SEGTEST_BIN) $(SEGEXEC_BIN) $(EXT2_IMG) tools/mkdisk.py
 	python tools/mkdisk.py
 	@echo "Expanding disk to 4MB and injecting font at LBA 2048..."
 	@python -c "import os; sz=os.path.getsize('$@'); open('$@','ab').write(b'\x00'*($(DISK_SIZE)-sz)); f=open('$(FONT_BIN)','rb').read(); d=open('$@','r+b'); d.seek(2048*512); d.write(f); print(f'Font {len(f)}B injected')"
@@ -243,3 +253,5 @@ run-debug: $(IMG) $(DISK_IMG)
 
 clean:
 	rm -rf $(BLDDIR)
+
+-include $(CXX_OBJS:.o=.d)

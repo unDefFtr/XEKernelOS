@@ -29,8 +29,8 @@ extern "C" void c_isr_handler(registers_t *r) {
     int from_user = ((r->cs & 3) == 3);
 
     /* ⚠ 这里**不要**给 ring0(同级) 帧"补" user_esp/user_ss！
-       同级帧只有 13 个字 (edi..eax, vec, err, eip, cs, eflags)，`user_esp`
-       位于偏移 52 —— 那正好是**程序自己的栈顶** (r 是帧起点, r+52 = 中断发生
+       同级帧只有 17 个字/68B (gs..ds, edi..eax, vec, err, eip, cs, eflags)，`user_esp`
+       位于偏移 68 —— 那正好是**程序自己的栈顶** (r 是帧起点, r+68 = 中断发生
        时的 ESP)。往那里写 8 字节会踩掉程序当前帧最底部的局部变量 ——
        实测把桌面 `text_cn()` 正在构造的 ioctl 结构体头 8 字节 (p.x/p.y/p.c)
        改坏, 导致 x 变成 0xFFFFF994 的负数 → 文字被画到屏幕外

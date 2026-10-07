@@ -424,9 +424,10 @@ static void sys_fork(registers_t *r) {
     child->ebx   = r->ebx;  child->ebp   = r->ebp;
     child->esi   = r->esi;  child->edi   = r->edi;
     child->eax   = 0;   /* fork 子进程首次返回 0 (通过 schedule 恢复) */
+    child->gs = r->gs; child->fs = r->fs;
+    child->es = r->es; child->ds = r->ds;
     child->eip   = r->eip;  child->cs    = r->cs;
     child->eflags = r->eflags;
-    child->esp   = r->_esp;
     child->user_esp = (r->cs & 3) ? r->user_esp : current_task->user_esp;
     child->user_ss  = 0x23;
     child->state = TASK_READY;
@@ -487,32 +488,22 @@ static void sys_fork(registers_t *r) {
     list_add_tail(&child->list, &ready_queue);
     list_add_tail(&child->all_list, &all_tasks);
 
-    /* Copy kernel stack frame to child.
-       帧长取决于**是否发生了特权切换**: ring3 帧由 CPU 额外压入 SS/ESP
-       → 15 个字; 同级 (ring0) 帧只有 EFLAGS/CS/EIP 3 个字 + err/vec +
-       pusha = 13 个字 —— ring0 兼容模式下 `int 0x80` 不切栈就是这种。
-       旧实现用 (kernel_stack_top - r) 推算帧长, 隐含"帧一定位于任务内核栈顶"
-       这个**前提在 ring0 模式下不成立** (帧在程序自己的栈上) → 算出的字数是
-       天文数字 → 从内核栈顶一路往下读越界 → #PF (实测 EIP 落在本函数内)。
-       帧的起点就是 r 本身, 因此直接按长度从 r 起拷; 目标固定留 15 个字的
-       registers_t 空间, ring0 时多出的 user_esp/user_ss 显式填好。 */
-    int frame_words = (r->cs & 3) ? 15 : 13;
+    /* 帧长取决于是否发生特权切换: ring3 帧含 user_esp/user_ss, Ring0 不含；
+       目标空间始终预留完整的用户帧大小。 */
+    u32 frame_bytes = (r->cs & 3) ? REGISTER_FRAME_USER_BYTES : REGISTER_FRAME_KERNEL_BYTES;
     u32 *csp = (u32 *)(child->kernel_stack + KSTACK_SIZE);
-    u32 *dst = csp - 15;
-    for (int i = 0; i < frame_words; i++)
+    u32 *dst = csp - (REGISTER_FRAME_USER_BYTES / sizeof(u32));
+    for (u32 i = 0; i < frame_bytes / sizeof(u32); i++)
         dst[i] = ((u32 *)r)[i];
 
     registers_t *cr = (registers_t *)dst;
+    cr->_esp = (u32)&cr->vec;
     cr->eax = 0;                        /* fork 子进程首次返回 0 */
-    cr->user_esp = child->user_esp;
-    cr->user_ss  = child->user_ss;
-    /* ⚠ `_esp` 槽的约定: 它的内容必须指向帧内 **vec 槽** (帧起始+32字节),
-       因为 common_isr 的返回序列是 `popa` (会从该槽加载 ESP) → `add esp,8`
-       → `iretd`; 只有 vec 槽 +8 才正好落在 eip 槽上。
-       这正是 pusha 在真实中断帧里记录的值 (硬件压入 SS/ESP/EFLAGS/CS/EIP +
-       stub 压 err/vec 之后 ESP 指向 vec 槽)。写成帧起始会让 iretd 从 esi/ebp
-       槽里取"EIP" → 跑飞到栈地址 (实测 EIP=0x0043FE9F)。 */
-    child->esp = (u32)cr + 32;
+    if (!(r->cs & 3)) {
+        cr->user_esp = child->user_esp;
+        cr->user_ss  = child->user_ss;
+    }
+    child->esp = (u32)&cr->vec;
 
     serial_write_str("fork: child pid ");
     serial_write_u32(child->pid);
@@ -625,22 +616,29 @@ static bool exec_replace_address_space(registers_t *r, const u8 *data, u32 sz) {
     *(--csp) = entry;        /* EIP */
     *(--csp) = 0;            /* err_code */
     *(--csp) = 0x20;         /* vec */
-    *(--csp) = 0;            /* eax */
-    *(--csp) = 0;            /* ecx */
-    *(--csp) = 0;            /* edx */
-    *(--csp) = 0;            /* ebx */
+    *(--csp) = 0;             /* eax */
+    *(--csp) = 0;             /* ecx */
+    *(--csp) = 0;             /* edx */
+    *(--csp) = 0;             /* ebx */
     csp--;
-    *csp = (u32)(csp - 3);   /* _esp */
     *(--csp) = 0;            /* ebp */
     *(--csp) = 0;            /* esi */
     *(--csp) = 0;            /* edi */
+    *(--csp) = 0x23;          /* ds */
+    *(--csp) = 0x23;          /* es */
+    *(--csp) = 0x23;          /* fs */
+    *(--csp) = 0x23;          /* gs */
 
+    registers_t *frame = (registers_t *)csp;
+    frame->_esp = (u32)&frame->vec;
     current_task->eip = entry;
-    current_task->esp = (u32)csp;
+    current_task->cs = 0x2B;
+    current_task->esp = (u32)&frame->vec;
     current_task->eflags = 0x202;
     current_task->user_stack = stack_top;
     current_task->user_esp = stack_top;
     current_task->user_ss  = 0x23;
+    current_task->gs = current_task->fs = current_task->es = current_task->ds = 0x23;
 
     /* 改写当前中断帧: 本次 iretd 直接进入新程序 */
     r->eip = entry;
@@ -648,6 +646,7 @@ static bool exec_replace_address_space(registers_t *r, const u8 *data, u32 sz) {
     r->eflags = 0x202;
     r->user_esp = stack_top;   /* iretd 弹出的 ring3 ESP */
     r->user_ss  = 0x23;
+    r->gs = r->fs = r->es = r->ds = 0x23;
     r->eax = 0;
     r->ecx = 0; r->edx = 0; r->ebx = 0;
     r->ebp = 0; r->esi = 0; r->edi = 0;

@@ -347,7 +347,7 @@ gdt_tss:
     dw 0x0000               ; base[15:0]  (filled at runtime)
     db 0x00                 ; base[23:16] (filled at runtime)
     db 0x89                 ; access: P=1, DPL=0, TSS available
-    db 0x40                 ; flags: G=0, D/B=0
+    db 0x00                 ; flags: G=0, reserved D/B=0
     db 0x00                 ; base[31:24] (filled at runtime)
 
 gdt_end:

@@ -94,6 +94,15 @@ if os.path.exists(lfstest_bin):
 else:
     print(f"Warning: {lfstest_bin} not found, skipping")
 
+# Segment context inheritance and exec-reset regression.
+for name_83, filename in (("SEGTEST BIN", "segtest.bin"),
+                          ("SEGEXEC BIN", "segexec.bin")):
+    binary = os.path.join(os.path.dirname(__file__), '..', 'build', filename)
+    if os.path.exists(binary):
+        add_binary(name_83, binary)
+    else:
+        print(f"Warning: {binary} not found, skipping")
+
 # User shell as launchable program (GUI Terminal icon)
 ushell_bin = os.path.join(os.path.dirname(__file__), '..', 'build', 'ushell.bin')
 if os.path.exists(ushell_bin):

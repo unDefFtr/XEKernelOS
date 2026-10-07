@@ -41,6 +41,7 @@ class PagingManager;  /* forward declaration */
 
 struct task_struct {
     u32 pid;
+    u32 gs, fs, es, ds;
     u32 ecx, edx, ebx, ebp, esi, edi;
     u32 eax;          /* 调度恢复时还原的 eax (fork 子进程首次返回为 0) */
     u32 eip, cs, esp, eflags;
@@ -86,7 +87,6 @@ struct task_struct {
     u32 sig_saved_esp;
 };
 
-/* Signal numbers */
 #define SIGKILL   9
 #define SIGINT    2
 #define SIGSEGV  11
@@ -111,8 +111,6 @@ extern struct task_struct *current_task;
 void task_init(void);
 int  task_create(void (*entry)(void *), void *arg);
 int  task_create_user(void *entry, u32 user_stack_top, PagingManager *user_pd);
-void task_start_user(void);   /* switch to user mode via direct iretd */
-void task_launch_user(void);   /* save current, build 5-entry iretd to ring3 */
 void task_exit(void);
 void task_cleanup_user(void);  /* cleanup user task after SYS_EXIT, restore idle */
 void task_yield(void);

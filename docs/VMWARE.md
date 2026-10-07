@@ -84,12 +84,12 @@ QEMU 与 VMware 的差异集中在三处，代码里都做了适配并打了日�
 | 24bpp 模式 | 可用            | 常用                       | ✅ gfx 本就支持；鼠标光标读写已按 bpp 处理                                                          |
 
 
-### 5.1 ~~未解决~~ → **2026-10-05 已定位并绕过**：VMware 上 ring3 入口 triple fault
+### 5.1 2026-10-05 排查记录（历史结论，已由 §5.4 修正）
 
-> **结论速览（细节见 §5.1.1~§5.1.4）**：`iret` 进 ring3 **成功**；失败点是
-> **ring3→ring0 的 `int 0x80` 特权栈切换**（这台机器 VMware 前端不可用）。
-> 已用 **Ring0 兼容模式**（`g_ring0_mode`，默认 true）绕过，VMware 上桌面可正常使用；
-> 完整 ring3 行为请用 QEMU。渲染类问题**与 VMware 无关**，见 `docs/ISSUES_2026-10-05.md`。
+> 当时把故障归因于 VMware 特权栈切换并使用 Ring0 绕过；该归因错误。
+> 后续隔离取证证明 CPU 已完成 Ring3→Ring0 切栈，失败发生在数据段尚未建立的
+> C 分发器内。当前默认 `g_ring0_mode=false`、`g_ring3_irq_on=true`；
+> 修复和回归见 §5.4。下文保留当时的取证过程，不作为当前运行限制。
 
 现象：约 2/3 概率在 `loader: flat binary 38964B` 之后弹  
 "virtual CPU ... shutdown state"（即 guest 三重故障），点 OK 重启后能正常进桌面。
@@ -328,13 +328,11 @@ CPU 在 ring3 空转、VM 一直活着。而桩 A（多一次 `int 0x80`）必�
 —— **全部与 QEMU 逐值相同且验证正确**。也就是说：**同样的表、同样的状态，  
 QEMU 能投递，VMware 直接三重故障。**
 
-> 补充：`syscall_handler()` 的 `ring3 sys=` 是**入口第一件事**就打印，它从未出现 ——  
-> 证明 CPU 根本没完成那次切换（不是我们的 C 代码崩的）。
+> 当时推断“没有 `ring3 sys=` 就说明没有完成特权切换”，此推断无效：
+> 在它之前还有 `c_isr_handler()` 的 `r->vec` 读取，空 DS 会先触发 #GP。
+> 2026-10-07 隔离取证已确认切栈成功，见 §5.4。
 
-**⇒ 判定：这台机器上 VMware 前端的 ring3→ring0 特权栈切换不可用。**  
-（`ULM` 与 `CPL0` 两种 monitor 模式都一样，所以与宿主 hypervisor 无关。）
-
-**应对：Ring0 兼容模式**（`src/kernel/user.cpp: bool g_ring0_mode`，当前 = `true`）。
+**当时的绕过：Ring0 兼容模式**（现在仅保留诊断开关，默认 `false`）。
 
 原理：不再用 `iret` 进 ring3，而是**远跳转** `ljmpl *(CS=0x18)`，程序以 **ring0** 运行。  
 这样后续 `int 0x80` 发生在**同级**，CPU 不会做特权栈切换 —— 正好绕开故障点。
@@ -363,8 +361,7 @@ if (g_ring0_mode) {
 > 基准逐像素一致。完整记录见 `docs/ISSUES_2026-10-05.md`。  
 > 冒烟回归里现在只剩 `RUN` 系列失败（即上表的结构性限制）。
 
-**要切回真正的 Ring3 用户态**：把 `g_ring0_mode` 改成 `false` 重新 `make`  
-（QEMU 上功能完整；VMware 上会立刻三重故障）。
+当前默认已是真正 Ring3，无需开启兼容模式；完整上下文修复见 §5.4。
 
 ### 5.2 2026-10-05 复验：QEMU 侧仍无法复现
 
@@ -406,3 +403,83 @@ ring3 sys=0000002E pid=00000001 ...  ← IOCTL 绘图，持续
 结论：这台机器上**没法用命令行自动开关虚拟机**，请手动打开  
 `build/vmware/XEKernelOS.vmx`（GUI 的 `vmware.exe` 是 x64，正常）。若后续要做  
 CI / 自动化开关机，需要换用 x64 的接口或补装 32 位组件。
+
+### 5.4 2026-10-07 Ring3 段上下文修复
+
+隔离取证的首次 IRQ0 已从 CS=0x2B 切到 SS=0x10 的任务内核栈，但
+DS/ES/FS/GS 全为空；C 分发器首次经 DS 读取 `r->vec` 触发 #GP(0)。
+关闭用户 IF 后，`int 0x80` 同样故障。QEMU/TCG 对空 DS 的行为不能证明
+硬件正确性，也不能把异常处理器里的再次 #GP 直接称作 #DF。
+
+统一帧协议：
+
+| 字段 | 字节偏移 |
+|---|---:|
+| GS / FS / ES / DS | 0 / 4 / 8 / 12 |
+| edi / esi / ebp / _esp | 16 / 20 / 24 / 28 |
+| ebx / edx / ecx / eax | 32 / 36 / 40 / 44 |
+| vec / err_code | 48 / 52 |
+| eip / cs / eflags | 56 / 60 / 64 |
+| user_esp / user_ss（仅跨特权） | 68 / 72 |
+
+Ring0 活帧只有 68B，不能读写不存在的用户尾部；Ring3 完整帧为 76B。
+ISR 用零扩展的 32 位槽保存段，调用 C 前建立四段=0x10 并 `cld`；
+唯一的 `isr_return` 出口恢复保存段和原 EFLAGS，不强行修正用户 null selector。
+调度和 fork 继承真实段状态；exec 与直接 Ring3 入口建立四段=0x23。
+`_esp` 与任务保存的 `esp` 指向帧内 `vec`，`popa` 跳过该槽，不用它切栈。
+TSS 描述符 flags 修正为 0x00；默认保留真正 Ring3、IRQ 与抢占调度。
+
+`make -B` 验证完整头文件迁移；内核规则生成 `.d` 依赖，后续布局变更会重编译
+`panic.cpp` 等消费者。`SEGTEST.BIN`/`SEGEXEC.BIN` 用同一 NASM 源构建，
+断言 null 段 syscall 原样返回、用户 DF 保留、fork/sleep 段继承、wait/reaper
+与 exec 段重置。`tools/smoke_serial.py` 每次运行独立检查 PASS/FAIL 和后续 ECHO。
+
+硬件复验必须使用隔离镜像：KVM (`QEMU_ACCEL=kvm`) 和 TCG (`tcg`) 顺序冒烟；
+VMware 使用独立目录的 BIOS+IDE 测试机，不覆盖 `build/vmware`，观察实际控制台、
+两次 SEGTEST、两次 GFXDEMO、SPIN 子进程完成后 Ctrl+C 与 `ECHO RING3OK`。
+另外单独验证 IF=0 的首批 GETFB/OPEN/IOCTL，以及故意空 DS 访存触发的
+`KERNEL PANIC: #GP`；后者按既有 panic 策略停机，不要求恢复 Shell。
+成功日志不得混入故障探针；只停止本次新建 VM，不用需要 guest Tools 的
+`vmrun captureScreen`。本节与 §5.3 的 Windows `vmrun` 限制不同，Linux 验证可用。
+
+#### 控制台 Ctrl+C 队列修复
+
+真实 PS/2 启动 SPIN 会留下 Return break；旧 `Keyboard::ctrl_c()` 只检查队首，
+该字节或普通输入会挡住后面的 Ctrl+C，导致串口启动的 smoke 通过而 VMware
+键盘启动的 SPIN 无法终止。用户批准追加此修复。
+
+PIT 在 IF=0 下扫描整个软件环形队列，只移除按时间顺序确认为 Ctrl+C 的 C make，
+原地保留其余扫描码和 Ctrl press/release 的顺序。`getchar()` 消费 Ctrl 转换时
+更新 `ctrl_`；该字段表示队首之前的状态，PIT 使用局部状态扫描，不提前修改它。
+否则重扫旧普通 C 或漏掉已被字符读取消费的 Ctrl release，会丢字或泄漏控制状态。
+该实现无动态分配，保留普通输入，不更改 SIGINT、IRQ 或抢占策略。
+
+现有 smoke 追加独立 PS/2 区间：键盘输入 `run spin.bin`，等待 child 完成，
+排入 `echo ps2ok` 但不提交，Ctrl+C 后再 Return。该区间必须依次出现 RUN、
+child done、signal killing、准确的 ECHO 读取和正文，不能使用串口 SPIN 的标记
+满足断言。本机 KVM 已复现修复前无法终止，修复后该场景及原有 smoke 全部通过。
+
+#### 本机硬件验收记录
+
+2026-10-07，Linux x64，VMware Workstation 25.0.1 build 25219725；
+正式配置保持 `g_ring0_mode=false`、`g_ring3_irq_on=true`。
+
+- 强制完整重编译成功；反汇编核对 ISR 保存/恢复及两个直接 Ring3 入口。
+- KVM 完整 smoke 退出码 0；两次段回归独立通过，桌面中文图标和时钟实际可见，
+  原有文件、LFN、fork/exec/wait、抢占与新增 PS/2 输入保留回归通过。
+- KVM 完成后顺序运行 TCG 完整 smoke，退出码 0；两者均输出
+  `=== 冒烟测试全部通过 ===`，并各自通过新增的 PS/2 队列回归。
+- VMware 隔离机实际控制台时钟跨越 14:31:12 → 14:31:15；两组段回归、两次
+  GFXDEMO、SPIN 的三次 child tick/完成均通过。随后 Ctrl+C 发出 SIGINT，
+  唤醒 Shell；串口和屏幕均显示 `ECHO RING3OK` 正文，后续 `echo afterok` 响应。
+  本次隔离机当前及存在的轮转日志无 `Triple fault.`。
+- KVM 和 VMware 的独立 IF=0 诊断均完成首批 GETFB/OPEN/IOCTL，未发生 C 入口 #GP。
+- KVM 和 VMware 的独立空 DS 访存探针均在串口及实际画面报告
+  `KERNEL PANIC: #GP`，`EIP=0x00400004`、`CS=0x0000002B`；按原策略停机，
+  VMware 日志无 `Triple fault.`。
+
+成功运行、IF=0 和故意异常使用不同镜像与日志；只关闭本次创建的测试 VM，
+未覆盖用户原有 VMware 镜像或停止用户原有 VM/QEMU。截图及串口证据保留在
+本次隔离目录的 `accepted/`、`if0/`、`fault/` 下。
+
+

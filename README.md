@@ -66,6 +66,13 @@ src/
 
 ## 构建运行
 
+默认启动桌面及后续用户程序时使用 **Ring3**：`src/kernel/user.cpp` 中
+`g_ring0_mode = false`，`g_ring3_irq_on = true`（启用中断与时间片抢占）。
+内核仍在 Ring0 执行；这两个开关是编译期配置，修改后需重新执行 `make`。
+中断入口保存并恢复 GS/FS/ES/DS，进入 C 前建立内核数据段并清 DF；用户合法的
+null selector 与 DF 原样恢复。VMware 三重故障根因与硬件回归见
+[VMWARE.md §5.4](docs/VMWARE.md#54-2026-10-07-ring3-段上下文修复)。
+
 ### Nix 开发环境
 
 安装 Nix 并启用 `nix-command`、`flakes` 后，在项目根目录执行：
@@ -96,6 +103,23 @@ nix develop --command python tools/desktop_shot.py  # 无图形会话的启动�
 
 `flake.lock` 固定 Nixpkgs 版本；首次使用需要联网获取依赖。更新依赖使用 `nix flake update`。
 提供 x86_64/aarch64 的 Linux 和 macOS shell；实际构建及 QEMU 启动验证覆盖 x86_64 Linux。
+
+段上下文行为回归与现有冒烟一起运行，两种 accelerator 顺序执行：
+
+```bash
+nix develop path:. --command make -B
+nix develop path:. --command env QEMU_ACCEL=kvm python tools/smoke_serial.py
+nix develop path:. --command env QEMU_ACCEL=tcg python tools/smoke_serial.py
+```
+
+`QEMU_ACCEL` 默认 `tcg`；KVM 需要可访问 `/dev/kvm`，失败不自动降级。
+测试复制启动盘和数据盘，数据写入仍保存在 `build/smoke.qcow2`。
+两次 `RUN SEGTEST.BIN` 分别检查 null 段 syscall、DF、fork/sleep 段继承、
+wait/reaper 恢复及 `SEGEXEC.BIN` 的 exec 段重置；每次都必须出现独立 PASS
+和对应 `ECHO SEG1/SEG2`。TCG 成功不能代替 KVM 或 VMware 验收。
+另以 PS/2 按键启动 SPIN，在自旋期间排入普通 ECHO 字符，再发送 Ctrl+C；
+必须终止自旋并原样执行该 ECHO，防止 Return break/普通扫描码阻塞信号。
+
 
 ### 手动安装依赖
 

@@ -36,6 +36,8 @@ void task_init(void) {
     main_task->pid = 0;
     main_task->state = TASK_RUNNING;
     main_task->eax = 0;
+    main_task->gs = 0x10; main_task->fs = 0x10;
+    main_task->es = 0x10; main_task->ds = 0x10;
     main_task->cs  = 0x18;   /* kernel code */
     main_task->user_esp = 0;
     main_task->user_ss  = 0x10;  /* kernel data */
@@ -83,18 +85,24 @@ int task_create(void (*entry)(void *), void *arg) {
     *(--sp) = 0;                 // ecx
     *(--sp) = 0;                 // edx
     *(--sp) = 0;                 // ebx
-    sp--;                        // sp points to _esp slot
-    *sp = (u32)(sp - 3);         // _esp = &stack[1011] (edi)
+    sp--;                        // _esp slot
+    *sp = 0;                     // initialized below to &frame->vec
     *(--sp) = 0;                 // ebp
     *(--sp) = 0;                 // esi
     *(--sp) = 0;                 // edi
-
+    *(--sp) = 0x10;              // ds
+    *(--sp) = 0x10;              // es
+    *(--sp) = 0x10;              // fs
+    *(--sp) = 0x10;              // gs
+    registers_t *frame = (registers_t *)sp;
+    frame->_esp = (u32)&frame->vec;
     t->pid = next_pid++;
     t->ecx = 0; t->edx = 0; t->ebx = 0; t->ebp = 0; t->esi = 0; t->edi = 0;
     t->eax = 0;
     t->eip = (u32)task_wrapper;
     t->cs  = 0x18;    /* kernel code */
-    t->esp = (u32)sp;
+    t->gs = 0x10; t->fs = 0x10; t->es = 0x10; t->ds = 0x10;
+    t->esp = (u32)&frame->vec;
     t->eflags = 0x202;
     t->user_esp = 0;
     t->user_ss  = 0x10;
@@ -159,17 +167,24 @@ int task_create_user(void *entry, u32 user_stack_top, PagingManager *user_pd) {
     *(--sp) = 0;                    // edx
     *(--sp) = 0;                    // ebx
     sp--;                           // _esp slot
-    *sp = (u32)(sp - 3);            // _esp → edi slot
+    *sp = 0;                        // initialized below to &frame->vec
     *(--sp) = 0;                    // ebp
     *(--sp) = 0;                    // esi
     *(--sp) = 0;                    // edi
+    *(--sp) = 0x23;                 // ds
+    *(--sp) = 0x23;                 // es
+    *(--sp) = 0x23;                 // fs
+    *(--sp) = 0x23;                 // gs
+    registers_t *frame = (registers_t *)sp;
+    frame->_esp = (u32)&frame->vec;
 
     t->pid = next_pid++;
     t->ecx = 0; t->edx = 0; t->ebx = 0; t->ebp = 0; t->esi = 0; t->edi = 0;
+    t->gs = 0x23; t->fs = 0x23; t->es = 0x23; t->ds = 0x23;
     t->eax = 0;
     t->eip = (u32)entry;
     t->cs  = 0x2B;    /* user code (ring3) */
-    t->esp = (u32)sp;
+    t->esp = (u32)&frame->vec;
     t->eflags = 0x202;
     t->user_esp = user_stack_top;   /* iretd 恢复 ring3 时使用 */
     t->user_ss  = 0x23;
@@ -216,32 +231,6 @@ int task_create_user(void *entry, u32 user_stack_top, PagingManager *user_pd) {
     return t->pid;
 }
 
-void task_start_user(void) {
-    if (!current_task || !current_task->paging) return;
-
-    __asm__ volatile("movb $'>', %%al; movw $0x3F8, %%dx; outb %%al, %%dx" ::: "dx","al");
-
-    /* Build the ring-3 iret frame on the kernel stack */
-    u32 *sp = (u32 *)(current_task->kernel_stack + KSTACK_SIZE);
-    *(--sp) = 0x23;                        // SS (user data)
-    *(--sp) = current_task->user_stack;    // ESP
-    *(--sp) = 0x002;                       // EFLAGS (IF=0, no hw interrupts)
-    *(--sp) = 0x2B;                        // CS (user code, RPL=3)
-    *(--sp) = current_task->eip;           // EIP
-
-    /* Load user page directory */
-    __asm__ volatile("movb $'C', %%al; movw $0x3F8, %%dx; outb %%al, %%dx" ::: "dx","al");
-    current_task->paging->load();
-    __asm__ volatile("movb $'R', %%al; movw $0x3F8, %%dx; outb %%al, %%dx" ::: "dx","al");
-
-    __asm__ volatile(
-        "mov %0, %%esp\n"
-        "iret\n"
-        :
-        : "r"(sp)
-    );
-    __builtin_unreachable();
-}
 
 void task_exit(void) {
     if (!current_task) return;
@@ -271,6 +260,8 @@ void task_exit(void) {
        schedule() will see TASK_DEAD, skip it, and free resources
        from the NEXT task's stack. */
     registers_t fake;
+    fake.gs = 0x10; fake.fs = 0x10; fake.es = 0x10; fake.ds = 0x10;
+    fake.cs = 0x18;
     fake.eflags = 0x202;
     fake.eip = 0;
     fake._esp = 0;
@@ -337,6 +328,10 @@ void schedule(registers_t *r) {
         current_task->ebp = r->ebp;
         current_task->esi = r->esi;
         current_task->edi = r->edi;
+        current_task->gs = r->gs;
+        current_task->fs = r->fs;
+        current_task->es = r->es;
+        current_task->ds = r->ds;
         current_task->eax = r->eax;
         current_task->eip = r->eip;
         current_task->cs  = r->cs;
@@ -472,6 +467,10 @@ void schedule(registers_t *r) {
     r->eax = nt->eax;   /* 还原各任务自己的 eax (fork 子进程首次=0) */
     r->eip = nt->eip;
     r->cs  = nt->cs;
+    r->gs = nt->gs;
+    r->fs = nt->fs;
+    r->es = nt->es;
+    r->ds = nt->ds;
     r->_esp = nt->esp;
     r->eflags = nt->eflags;
     /* 诊断: 恢复帧的关键字段 (默认关闭 — 100Hz 串口洪泛会触发
@@ -569,9 +568,7 @@ void task_do_exit(registers_t *r, u32 exit_code) {
             "pushl %%ebx\n\t"       /* schedule(&g_reaper_frame) */
             "call task_schedule_c\n\t"
             "movl %%ebx, %%esp\n\t" /* 帧已被填成下一任务的上下文 */
-            "popa\n\t"              /* 复刻 common_isr 的返回序列 */
-            "addl $8, %%esp\n\t"
-            "iret\n\t"
+            "jmp isr_return\n\t"
             "ud2\n"
             :
             : "r"(sp), "r"(fr)
@@ -584,11 +581,18 @@ void task_do_exit(registers_t *r, u32 exit_code) {
        mov 切回 kernel_main 栈后返回, task_cleanup_user 负责释放 */
     PagingManager::get_kernel_paging()->load();
     __asm__ volatile(
+        "movw $0x10, %%ax\n"
+        "movw %%ax, %%ds\n"
+        "movw %%ax, %%es\n"
+        "movw %%ax, %%fs\n"
+        "movw %%ax, %%gs\n"
+        "cld\n"
         "mov %0, %%esp\n"
         "pop %%ebp\n"
         "ret\n"
         :
         : "m"(g_entry_esp)
+        : "eax", "memory"
     );
     __builtin_unreachable();
 }

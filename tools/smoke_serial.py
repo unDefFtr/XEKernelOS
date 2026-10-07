@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """XEKernelOS 串口冒烟测试 (2026-08-16)
 
-不依赖 QEMU monitor 管道 (qemu_auto.py 在 Windows 管道下会卡住),
-只走串口 TCP: 注入命令 + 收集串口日志做断言。
+命令主要走串口 TCP；QEMU monitor TCP 注入 PS/2 按键并抓取屏幕。
+另以真实 PS/2 RUN/普通输入/Ctrl+C 检查软件扫描码队列的保留与终止行为。
 
 判定点:
   1. boot 到 "tasks ready" (内核完整启动)
@@ -13,7 +13,7 @@
 
 用法: python tools/smoke_serial.py
 """
-import codecs, hashlib, os, socket, subprocess, sys, time
+import codecs, hashlib, os, shutil, socket, subprocess, sys, time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(BASE)
@@ -33,6 +33,10 @@ CMDS = [
     'RUN DESKTOP.BIN', # GUI 桌面 → 探针 → sendkey esc 退出
     'ECHO Z',          # ESC 退出后 Shell 恢复 (屏幕对比断言)
     'ECHO W',          # 双保险: 屏幕应继续变化
+    'RUN SEGTEST.BIN',
+    'ECHO SEG1',
+    'RUN SEGTEST.BIN',
+    'ECHO SEG2',
     'RUN SPIN.BIN',    # 抢占式调度: 父进程纯死循环 + 子进程心跳打印
     'ECHO KILLOK',     # Ctrl+C 终止自旋进程后 Shell 必须恢复
     'RUN LFSTEST.BIN', # 长文件名 (LFN) 读侧: 列目录 + 长名/短名打开
@@ -55,15 +59,24 @@ def main():
     if not (os.path.exists(img) and os.path.exists(disk)):
         log('FAIL: 构建产物缺失, 先 make'); return 1
 
+    data_img = os.path.join(BLD, 'smoke-data.img')
+    shutil.copyfile(disk, data_img)
     qcow2 = os.path.join(BLD, 'smoke.qcow2')
     if os.path.exists(qcow2): os.remove(qcow2)
     subprocess.run(['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2', '-S', '4M',
-                    disk, qcow2], check=True, capture_output=True)
+                    data_img, qcow2], check=True, capture_output=True)
 
+    boot_img = os.path.join(BLD, 'smoke-boot.img')
+    shutil.copyfile(img, boot_img)
+
+    accel = os.environ.get('QEMU_ACCEL', 'tcg')
+    accel_args = ['-accel', accel]
+    if accel == 'kvm':
+        accel_args += ['-cpu', 'host']
     p = subprocess.Popen(
-        [QEMU,
+        [QEMU, *accel_args,
          '-drive', f'file={qcow2},format=qcow2,if=ide,index=1',
-         '-drive', f'file={img},format=raw,if=ide,index=0',
+         '-drive', f'file={boot_img},format=raw,if=ide,index=0',
          '-m', '32', '-boot', 'order=c', '-display', 'none', '-no-reboot',
          '-serial', f'tcp:127.0.0.1:{PORT},server=on,wait=on',
          '-monitor', f'tcp:127.0.0.1:{PORT+1},server=on,wait=off'],
@@ -238,6 +251,9 @@ def main():
             elif c == 'ECHO W':
                 pw = screendump('s1_ew.ppm')
                 log(f'屏幕(ECHO W): {pw}')
+            elif c == 'RUN SEGTEST.BIN':
+                # Dedicated assertions below; no graphics probe applies.
+                pass
             elif c.startswith('RUN'):
                 # gfx_demo: CLS 深蓝 + 左上红矩形, 2s 退出
                 probe = screendump(f's1_{tag}.ppm', probe=(50, 60))
@@ -247,12 +263,48 @@ def main():
 
         drain(2.0)
 
+        # PS/2 路径：RUN 的 Return break 和自旋期间的普通输入不能挡住
+        # Ctrl+C。终止后再提交原队列里的 ECHO，验证普通字符没有被丢弃。
+        ps2_start = len(serial)
+        def type_ps2(text):
+            for char in text:
+                sendkey({' ': 'spc', '.': 'dot'}.get(char, char))
+        type_ps2('run spin.bin')
+        sendkey('ret')
+        drain(5.0)
+        type_ps2('echo ps2ok')
+        sendkey('ctrl-c')
+        drain(3.0)
+        sendkey('ret')
+        drain(2.0)
+        ps2_serial = serial[ps2_start:]
+
         # ---- 断言 ----
         ok = True
         for bad in ('PANIC', 'Page Fault', 'kernel_panic', 'Triple', '#DF'):
             if bad in serial:
                 log(f'FAIL: 串口日志出现 {bad}'); ok = False
         if ok: log('OK: 无 panic')
+        for run_no, echo in enumerate(('SEG1', 'SEG2'), 1):
+            run_marker = f'[READ] "RUN SEGTEST.BIN"'
+            echo_marker = f'[READ] "ECHO {echo}"'
+            starts = [i for i in range(len(serial))
+                      if serial.startswith(run_marker, i)]
+            start = starts[run_no - 1] if len(starts) >= run_no else -1
+            end = serial.find(echo_marker, start + len(run_marker)) if start >= 0 else -1
+            if start < 0 or end < 0:
+                log(f'FAIL: SEGTEST run {run_no} 或后续 ECHO {echo} 未读到')
+                ok = False
+                continue
+            interval = serial[start:end]
+            if any(marker in interval for marker in
+                   ('SEGTEST: FAIL', 'SEGEXEC: FAIL')) or any(
+                    marker not in interval for marker in
+                    ('SEGTEST: CHILD PASS', 'SEGEXEC: PASS', 'SEGTEST: PASS')):
+                log(f'FAIL: SEGTEST run {run_no} 缺少本次区间 PASS 或出现 FAIL')
+                ok = False
+            else:
+                log(f'OK: SEGTEST run {run_no} 独立回归标记与 ECHO {echo}')
 
         # [READ] 回显与 shell 提示符在同一行 (提示符先输出), 用 in 匹配
         rd_lines = [l for l in serial.splitlines() if '[READ]' in l and l.lstrip().startswith('XEKernel')]
@@ -349,6 +401,19 @@ def main():
         else:
             log(f'OK: 抢占式调度 (SPIN 子进程 tick={n_tick}) + Ctrl+C(SIGINT) '
                 f'终止自旋进程 + Shell 恢复 + SYS_TASK_LIST 可用')
+
+        # 同一场景经 PS/2 而不是串口启动；断言只看本次独立日志区间。
+        ps2_run = ps2_serial.find('[READ] "run spin.bin"')
+        ps2_done = ps2_serial.find('SPIN: child done')
+        ps2_kill = ps2_serial.find('signal: killing')
+        ps2_echo = ps2_serial.find('[READ] "echo ps2ok"')
+        ps2_body = ps2_serial.find('\nps2ok', ps2_echo)
+        if not (0 <= ps2_run < ps2_done < ps2_kill < ps2_echo < ps2_body
+                and ps2_serial.count('SPIN: child tick') >= 2):
+            log('FAIL: PS/2 RUN/Ctrl+C/Shell 恢复或普通输入保留失败')
+            ok = False
+        else:
+            log('OK: PS/2 RUN + Ctrl+C 越过队列普通输入 + ECHO 保留并执行')
 
         # ---- M2: VFAT 长文件名 (LFN) 读侧 ----
         i_lfs   = serial.find('LFSTEST: list')

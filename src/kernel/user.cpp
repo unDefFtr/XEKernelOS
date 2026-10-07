@@ -10,13 +10,11 @@ PagingManager *g_user_pd = nullptr;
 u32 g_entry_esp = 0;
 char g_user_args[256];
 
-/* 见 user.h 的说明。默认 false = 进 ring3 时 IF=0 (VMware 诊断用)。
-   确认结论后改成 true 即可恢复抢占式用户态。 */
-bool g_ring3_irq_on = false;
+/* 默认启用 Ring3 中断与时间片抢占；false 仅用于 VMware 诊断。 */
+bool g_ring3_irq_on = true;
 
-/* 见 user.h 的说明。true = 程序跑 ring0（绕开 VMware 上失败的特权栈切换）。
-   定位结束后若要恢复真正的 Ring3 用户态，把它改成 false 即可。 */
-bool g_ring0_mode = true;
+/* 默认进入 Ring3；true 仅用于 VMware Ring0 兼容/演示。 */
+bool g_ring0_mode = false;
 
 void user_tss_set_esp0(u32 esp0) {
     u8 *tss = (u8 *)tss_page;
@@ -251,9 +249,15 @@ void enter_user_mode(u32 entry, u32 stack_top, PagingManager *pd,
             "pushl %[efl]\n"         /* EFLAGS (IF 按 g_ring3_irq_on) */
             "pushl $0x2B\n"          /* CS  (用户代码选择子) */
             "pushl %[eip]\n"         /* EIP */
+            "movw $0x23, %%ax\n"
+            "movw %%ax, %%ds\n"
+            "movw %%ax, %%es\n"
+            "movw %%ax, %%fs\n"
+            "movw %%ax, %%gs\n"
             "iret\n"
             :
             : [usp] "r"((u32)stk), [efl] "r"(efl), [eip] "r"(entry)
+            : "eax", "memory"
         );
     } else {
         __asm__ volatile(
@@ -262,9 +266,15 @@ void enter_user_mode(u32 entry, u32 stack_top, PagingManager *pd,
             "pushl %[efl]\n"         /* EFLAGS (IF 按 g_ring3_irq_on) */
             "pushl $0x2B\n"          /* CS */
             "pushl %[eip]\n"         /* EIP */
+            "movw $0x23, %%ax\n"
+            "movw %%ax, %%ds\n"
+            "movw %%ax, %%es\n"
+            "movw %%ax, %%fs\n"
+            "movw %%ax, %%gs\n"
             "iret\n"
             :
             : [usp] "r"(stack_top), [efl] "r"(efl), [eip] "r"(entry)
+            : "eax", "memory"
         );
     }
     __builtin_unreachable();

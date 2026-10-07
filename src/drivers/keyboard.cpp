@@ -155,6 +155,9 @@ char Keyboard::getchar() {
         u8 s = read_scan();
         /* read_scan 空转超时返回 0 → 回到循环头重新检查串口 */
         if (s == 0) continue;
+        /* ctrl_ 是队首之前已消费的状态；PIT 扫描不能提前改变它。 */
+        if (s == 0x1D) { ctrl_ = 1; continue; }
+        if (s == 0x9D) { ctrl_ = 0; continue; }
         if (s == SC_LSHIFT || s == SC_RSHIFT) { shift_ = 1; continue; }
         if (s == (SC_LSHIFT | 0x80) || s == (SC_RSHIFT | 0x80)) { shift_ = 0; continue; }
         if (s == SC_CAPS) { caps_ = !caps_; continue; }
@@ -189,13 +192,24 @@ void Keyboard::flush() {
 }
 
 int Keyboard::ctrl_c() {
-    /* IRQ1 中断已把字节放入软件缓冲; 这里 peek 缓冲判断 Ctrl+C.
-       普通字符留在缓冲等 read_scan 消费, Ctrl/Ctrl+C 键字节被消费. */
-    if (kb_head_ == kb_tail_) return 0;   /* 缓冲空 */
-
-    u8 data = kb_buf_[kb_tail_];          /* peek 不消费 */
-    if (data == 0x1D)      { ctrl_ = 1; kb_tail_ = (kb_tail_ + 1) % KB_BUF_SIZE; return 0; }
-    if (data == 0x9D)      { ctrl_ = 0; kb_tail_ = (kb_tail_ + 1) % KB_BUF_SIZE; return 0; }
-    if (data == 0x2E && ctrl_) { kb_tail_ = (kb_tail_ + 1) % KB_BUF_SIZE; return 1; }
-    return 0;
+    /* PIT 调用时 IF=0，IRQ1 不会并发写入。保留普通码和 Ctrl 转换
+       的顺序，只移除 Ctrl+C 的 make；重复扫描从队首之前的状态开始。 */
+    int read = kb_tail_;
+    int write = kb_tail_;
+    int detected = 0;
+    int ctrl = ctrl_;
+    while (read != kb_head_) {
+        u8 data = kb_buf_[read];
+        if (data == 0x1D) ctrl = 1;
+        if (data == 0x9D) ctrl = 0;
+        if (data == 0x2E && ctrl) {
+            detected = 1;
+        } else {
+            if (write != read) kb_buf_[write] = data;
+            write = (write + 1) % KB_BUF_SIZE;
+        }
+        read = (read + 1) % KB_BUF_SIZE;
+    }
+    kb_head_ = write;
+    return detected;
 }

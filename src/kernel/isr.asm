@@ -67,9 +67,39 @@ extern c_isr_handler
 
 common_isr:
     pusha
+    xor eax, eax
+    mov ax, ds
+    push eax
+    xor eax, eax
+    mov ax, es
+    push eax
+    xor eax, eax
+    mov ax, fs
+    push eax
+    xor eax, eax
+    mov ax, gs
+    push eax
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    cld
     push esp
     call c_isr_handler
     add esp, 4
+
+; ESP points at registers_t.gs; IF is clear. Reused by the exit trampoline.
+global isr_return
+isr_return:
+    pop eax
+    mov gs, ax
+    pop eax
+    mov fs, ax
+    pop eax
+    mov es, ax
+    pop eax
+    mov ds, ax
     popa
     add esp, 8
     iretd
